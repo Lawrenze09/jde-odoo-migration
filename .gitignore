@@ -1,0 +1,9 @@
+Set-Content .gitignore @"
+venv/
+__pycache__/
+*.pyc
+.env
+output/
+logs/
+.DS_Store
+"@
