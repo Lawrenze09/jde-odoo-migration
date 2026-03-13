@@ -1,7 +1,11 @@
 venv/
+.venv/
 __pycache__/
 *.pyc
+*.log
 .env
 output/
 logs/
+*.xlsx
+mock_data/*.csv
 .DS_Store
