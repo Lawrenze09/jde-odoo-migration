@@ -59,3 +59,4 @@ class BaseExtractor(ABC):
                 implement this method (enforced by @abstractmethod).
         """
         pass
+    
