@@ -9,3 +9,6 @@ logs/
 *.xlsx
 mock_data/*.csv
 .DS_Store
+scratch_*.py
+verify*.py
+test_scratch.py
