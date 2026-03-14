@@ -63,6 +63,8 @@ class CustomerTransformer:
             # customer_rank=1 means this partner appears in customer lists
             # customer_rank=0 means vendor or employee — different workflow
             "customer_rank": 1 if record.get("AT1") == JDE_CUSTOMER_TYPE else 0,
+            # Raw AT1 preserved for validator Rule 4
+            "_jde_at1": record.get("AT1"),
 
             # Contact
             "phone": self._normalize_phone(record.get("PH1")),
