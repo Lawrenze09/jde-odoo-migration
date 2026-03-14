@@ -9,7 +9,7 @@ Input:  .env file at project root (or system environment variables)
 Output: Settings instance accessible via get_settings()
 """
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from functools import lru_cache
 
@@ -46,11 +46,12 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
     mock_data_path: str = Field(default="mock_data/F0101.csv")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
         # Allows DRY_RUN in .env to map to dry_run in Python
-        case_sensitive = False
+        case_sensitive=False,
+    )
 
 
 @lru_cache()
