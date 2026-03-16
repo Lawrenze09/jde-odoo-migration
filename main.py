@@ -1,3 +1,4 @@
+# main.py
 """
 main.py
 
@@ -63,9 +64,6 @@ Examples:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        # store_true means the flag is False by default.
-        # When --dry-run is passed, it becomes True.
-        # No value needed — presence of the flag is the signal.
         help="Preview mode — transform and validate but do not write to Odoo",
     )
 
@@ -112,20 +110,17 @@ def run_customer_migration(args, settings) -> int:
     logger.info("=" * 60)
 
     try:
-        # ── Stage 1: Extract ──────────────────────────────────────────
+        # ── Stage 1: Extract ─────────────────────────────────────────
         logger.info("STAGE 1 — Extract")
 
         if args.source == "mock":
             extractor = MockExtractor()
         else:
-            # Oracle extractor — built in Phase 4
             logger.error("Oracle source not yet implemented. Use --source mock.")
             return 1
 
         records = extractor.extract()
 
-        # Apply --limit if specified
-        # Useful for testing: run first 10 records before committing to full set
         if args.limit:
             records = records[:args.limit]
             logger.info(f"Limit applied — processing {len(records)} records")
@@ -141,15 +136,18 @@ def run_customer_migration(args, settings) -> int:
         valid_records, failed_records = validator.validate_batch(transformed)
 
         # ── Stage 4: Load ─────────────────────────────────────────────
-        # Define is_dry_run once — CLI flag takes full precedence over .env
+        # CLI flag takes full precedence over .env DRY_RUN setting
         is_dry_run = args.dry_run
+
+        # Initialize load_result_for_report to None — stays None for dry runs.
+        # Only populated for live runs so the report and summary log can use it.
+        load_result_for_report = None
 
         logger.info("STAGE 4 — Load")
 
         if is_dry_run:
-            # Dry run — write preview CSV instead of calling Odoo
             logger.info("DRY RUN mode — writing preview CSV, skipping Odoo")
-            loader = CsvLoader()
+            loader     = CsvLoader()
             valid_path = loader.load(valid_records)
             failed_path = loader.load_failed(failed_records)
             if valid_path:
@@ -157,10 +155,10 @@ def run_customer_migration(args, settings) -> int:
             if failed_path:
                 logger.info(f"Failed records:  {failed_path}")
         else:
-            # Live run — atomic Odoo load
             from loaders.odoo_loader import OdooLoader
-            loader = OdooLoader()
-            load_result = loader.load(valid_records)
+            loader                 = OdooLoader()
+            load_result            = loader.load(valid_records)
+            load_result_for_report = load_result
             if load_result.failed > 0:
                 logger.error(
                     f"Batch stopped — {load_result.failed} record(s) failed. "
@@ -171,26 +169,35 @@ def run_customer_migration(args, settings) -> int:
         if args.report:
             logger.info("STAGE 5 — Report")
             from reports.migration_report import MigrationReport
-            report = MigrationReport()
+            report      = MigrationReport()
             report_path = report.generate(
                 valid_records=valid_records,
                 failed_records=failed_records,
                 dry_run=is_dry_run,
                 source=args.source,
+                load_result=load_result_for_report,
             )
             logger.info(f"Report generated: {report_path}")
 
-        # ── Summary ───────────────────────────────────────────────────
+        # ── Summary log ───────────────────────────────────────────────
+        # Use load result counts for live runs, validation counts for dry runs.
+        # load_result_for_report is None for dry runs — guard before accessing.
+        if load_result_for_report and not is_dry_run:
+            success_count = load_result_for_report.loaded
+            success_rate  = (success_count / len(records) * 100) if records else 0
+        else:
+            success_count = len(valid_records)
+            success_rate  = (success_count / len(records) * 100) if records else 0
+
         logger.info("=" * 60)
         logger.info("MIGRATION COMPLETE")
         logger.info(f"Total extracted: {len(records)}")
         logger.info(f"Valid records:   {len(valid_records)}")
         logger.info(f"Failed records:  {len(failed_records)}")
-        logger.info(
-            f"Success rate:    "
-            f"{len(valid_records) / len(records) * 100:.1f}%"
-            if records else "N/A"
-        )
+        if load_result_for_report and not is_dry_run:
+            logger.info(f"Created in Odoo: {load_result_for_report.loaded}")
+            logger.info(f"Skipped:         {load_result_for_report.skipped}")
+        logger.info(f"Success rate:    {success_rate:.1f}%")
         logger.info("=" * 60)
 
         return 0
@@ -205,12 +212,10 @@ def main():
     Parse CLI arguments and dispatch to the correct migration pipeline.
     Exit code reflects pipeline success or failure — useful for automation.
     """
-    parser = build_parser()
-    args = parser.parse_args()
+    parser   = build_parser()
+    args     = parser.parse_args()
     settings = get_settings()
 
-    # Override dry_run: CLI flag takes precedence over .env setting.
-    # If --dry-run is passed on CLI, it's always a dry run regardless of .env.
     if args.dry_run:
         logger.info("--dry-run flag detected — overriding settings.dry_run")
 
@@ -225,3 +230,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
