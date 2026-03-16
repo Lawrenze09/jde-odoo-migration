@@ -141,9 +141,12 @@ def run_customer_migration(args, settings) -> int:
         valid_records, failed_records = validator.validate_batch(transformed)
 
         # ── Stage 4: Load ─────────────────────────────────────────────
+        # Define is_dry_run once — CLI flag takes full precedence over .env
+        is_dry_run = args.dry_run
+
         logger.info("STAGE 4 — Load")
 
-        if args.dry_run or settings.dry_run:
+        if is_dry_run:
             # Dry run — write preview CSV instead of calling Odoo
             logger.info("DRY RUN mode — writing preview CSV, skipping Odoo")
             loader = CsvLoader()
@@ -154,9 +157,15 @@ def run_customer_migration(args, settings) -> int:
             if failed_path:
                 logger.info(f"Failed records:  {failed_path}")
         else:
-            # Live run — Odoo loader (Step 16)
-            logger.warning("Live Odoo load not yet implemented. Use --dry-run.")
-            return 1
+            # Live run — atomic Odoo load
+            from loaders.odoo_loader import OdooLoader
+            loader = OdooLoader()
+            load_result = loader.load(valid_records)
+            if load_result.failed > 0:
+                logger.error(
+                    f"Batch stopped — {load_result.failed} record(s) failed. "
+                    f"batch_id: {load_result.batch_id}"
+                )
 
         # ── Stage 5: Report ───────────────────────────────────────────
         if args.report:
@@ -166,7 +175,7 @@ def run_customer_migration(args, settings) -> int:
             report_path = report.generate(
                 valid_records=valid_records,
                 failed_records=failed_records,
-                dry_run=args.dry_run or settings.dry_run,
+                dry_run=is_dry_run,
                 source=args.source,
             )
             logger.info(f"Report generated: {report_path}")
@@ -216,4 +225,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
