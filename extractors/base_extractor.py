@@ -10,6 +10,10 @@ This guarantees that the transformer, validator, and loader never need
 to know which source they are processing. They call extract() and receive
 the same structure regardless of source.
 
+Supports both full load and incremental sync:
+    Full load:   extract(last_upmj=0, last_upmt=0) — returns all records
+    Incremental: extract(last_upmj=X, last_upmt=Y) — returns only newer records
+
 Input:  Depends on the concrete implementation (file path, DB connection)
 Output: list[dict] where each dict is one raw JDE record with column names
         as keys: AN8, ALPH, AT1, PH1, ADD1, ADD2, CTY1, ADDS, ADDZ,
@@ -33,26 +37,46 @@ class BaseExtractor(ABC):
     """
 
     @abstractmethod
-    def extract(self) -> list[dict]:
+    def extract(
+        self,
+        last_upmj: int = 0,
+        last_upmt: int = 0,
+    ) -> list[dict]:
         """
         Extract records from the data source.
 
-        Returns a list of raw JDE records. Each dict represents one row
-        from the F0101 Address Book table. Keys match JDE column names
-        exactly — no transformation or validation is done here.
-        That is the transformer's and validator's job.
+        When last_upmj=0 and last_upmt=0, returns all records (full load).
+        When watermark values are provided, returns only records updated
+        after that point — incremental sync mode.
+
+        Filter logic for incremental mode:
+            UPMJ > last_upmj
+            OR (UPMJ == last_upmj AND UPMT > last_upmt)
+
+        This correctly handles multiple updates on the same Julian date
+        by using UPMT as a tiebreaker within the same day.
+
+        Args:
+            last_upmj (int): Julian date watermark from previous run.
+                             0 means first run — return all records.
+            last_upmt (int): Time in seconds watermark from previous run.
+                             0 means first run — return all records.
 
         Returns:
-            list[dict]: Raw JDE records. Example single record:
-                {
-                    "AN8": 1001,
-                    "ALPH": "Limketkai Center Inc",
-                    "AT1": "C",
-                    "PH1": "+63 82 234 5678",
-                    "ADD1": "Limketkai Drive",
-                    "CTY1": "Cagayan de Oro",
-                    ...
-                }
+            list[dict]: Raw JDE records. Each dict represents one row
+                        from the F0101 Address Book table. Keys match
+                        JDE column names exactly. Example:
+                        {
+                            "AN8":  "1001",
+                            "ALPH": "Limketkai Center Inc",
+                            "AT1":  "C",
+                            "PH1":  "+63 82 234 5678",
+                            "ADD1": "Limketkai Drive",
+                            "CTY1": "Cagayan de Oro",
+                            "UPMJ": "126072",
+                            "UPMT": "28800",
+                            ...
+                        }
 
         Raises:
             NotImplementedError: Implicitly, if subclass does not
