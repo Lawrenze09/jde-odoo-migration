@@ -78,6 +78,12 @@ Examples:
         action="store_true",
         help="Generate an Excel reconciliation report after the run",
     )
+    parser.add_argument(
+        "--sync",
+        action="store_true",
+        help="Run incremental sync instead of full migration. "
+            "Only processes records updated since last run.",
+    )
 
     return parser
 
@@ -217,6 +223,19 @@ def main():
 
     if args.dry_run:
         logger.info("--dry-run flag detected — overriding settings.dry_run")
+
+    if args.sync:
+        from sync.sync_engine import SyncEngine, SyncOutcome
+        engine = SyncEngine(
+            source=args.source,
+            dry_run=args.dry_run,
+            generate_report=args.report,
+            limit=args.limit,
+        )
+        sync_result = engine.run()
+        # Map outcome to exit code — schedulers need a simple pass/fail
+        failed_outcomes = {SyncOutcome.FAILED, SyncOutcome.PARTIAL}
+        sys.exit(1 if sync_result.outcome in failed_outcomes else 0)
 
     if args.table == "customers":
         exit_code = run_customer_migration(args, settings)
