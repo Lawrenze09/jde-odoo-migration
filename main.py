@@ -1,4 +1,3 @@
-# main.py
 """
 main.py
 
