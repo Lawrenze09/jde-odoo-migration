@@ -41,6 +41,7 @@ class LoadStatus(Enum):
     """
     PENDING       = "PENDING"
     LOADED        = "LOADED"
+    SKIPPED       = "SKIPPED"
     FAILED        = "FAILED"
     NOT_PROCESSED = "NOT_PROCESSED"
 
@@ -366,7 +367,7 @@ class OdooLoader:
             if an8 in already_loaded_an8s:
                 result.skipped += 1
                 result.records.append(
-                    RecordResult(an8=an8, status=LoadStatus.LOADED)
+                    RecordResult(an8=an8, status=LoadStatus.SKIPPED)
                 )
                 logger.debug(f"SKIPPED (already loaded) | AN8={an8} | {name}")
                 continue
