@@ -26,7 +26,7 @@ connected to any employer or client.
 
 Phase 1 complete — Customer master data (F0101) migration fully operational.
 Phase 2 complete — Incremental sync with UPMJ+UPMT watermark tracking.
-Phase 3 in progress — Item master data (F4101) migration.
+Phase 3 complete — Item master data (F4101) migration fully operational.
 
 ## What it does
 
