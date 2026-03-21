@@ -25,6 +25,8 @@ connected to any employer or client.
 ## Status
 
 Phase 1 complete — Customer master data (F0101) migration fully operational.
+Phase 2 complete — Incremental sync with UPMJ+UPMT watermark tracking.
+Phase 3 in progress — Item master data (F4101) migration.
 
 ## What it does
 
@@ -62,6 +64,43 @@ python main.py --table customers --dry-run --limit 10
 - Street address and city must be present
 - Zip code must be numeric if provided
 
+## UOM Mapping
+
+The JDE→Odoo unit of measure mapping is configured in `config/uom_mapping.csv`.
+This file must be customized for each Odoo deployment.
+
+### Why this matters
+
+Every Odoo instance has different UOM names depending on version, locale,
+and installed modules. The exact names were verified against this project's
+Odoo instance using:
+
+    models.execute_kw(db, uid, password, "uom.uom", "search_read",
+                        [[]], {"fields": ["id", "name"]})
+
+### Current mapping (verified against Odoo saas-19.2 free trial)
+
+| JDE Code | Odoo Name | Category | Notes                                          |
+| -------- | --------- | -------- | ---------------------------------------------- |
+| EA       | Units     | Unit     | Each/Unit                                      |
+| CS       | Units     | Unit     | Case — flattened to base unit (simplification) |
+| KG       | kg        | Weight   | Kilogram                                       |
+| L        | L         | Volume   | Liter                                          |
+| HR       | Hours     | Time     | Hour                                           |
+
+### For a different Odoo deployment
+
+1. Run the UOM discovery script to get exact names from your instance
+2. Update `config/uom_mapping.csv` with the correct `odoo_name` values
+3. The `category` column is deployment-independent — keep your own category grouping
+
+**Note:** `CS` (Case) is intentionally mapped to `Units` as a simplification.
+In a full implementation, define a custom "Case" UOM in Odoo with a conversion
+ratio to Units.
+
+```
+
 ## Project structure
 
 See individual module docstrings for full documentation.
+```
