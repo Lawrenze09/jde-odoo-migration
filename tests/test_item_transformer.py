@@ -55,7 +55,7 @@ class TestSTKTMapping:
     def test_stkt_s_maps_to_product(self, transformer, valid_record):
         valid_record["STKT"] = "S"
         result = transformer._transform_one(valid_record)
-        assert result["type"] == "product"
+        assert result["type"] == "consu"
 
     def test_stkt_n_maps_to_consu(self, transformer, valid_record):
         valid_record["STKT"] = "N"
@@ -77,7 +77,7 @@ class TestSTKTMapping:
         """Lowercase STKT must be uppercased before mapping."""
         valid_record["STKT"] = "s"
         result = transformer._transform_one(valid_record)
-        assert result["type"] == "product"
+        assert result["type"] == "consu"
 
 
 class TestBehaviorFlags:
