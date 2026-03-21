@@ -28,7 +28,7 @@ logger = get_logger(__name__)
 # Maps JDE stocking type to Odoo product.template 'type' field value.
 # Valid STKT values: S (Stocked), N (Non-stocked), O (Outside operations)
 STKT_TO_ODOO_TYPE = {
-    "S": "product",   # Stocked → storable product (inventory tracked)
+    "S": "consu",   # Stocked → storable product (inventory tracked)
     "N": "consu",     # Non-stocked → consumable (no inventory tracking)
     "O": "service",   # Outside operations → service
 }
