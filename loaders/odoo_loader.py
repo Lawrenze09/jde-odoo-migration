@@ -173,24 +173,55 @@ class OdooLoader:
 
     def _init_transaction_log(self):
         """
-        Create the transaction log table if it does not exist.
-        UNIQUE(batch_id, an8) prevents duplicate log entries per run.
+        Create or migrate the transaction log table.
+        Adds entity_type and entity_id columns if they don't exist —
+        safe to run on an existing database with F0101 migration history.
+        entity_type: 'customer' | 'item'
+        entity_id:   AN8 (as string) for customers, ITM for items
         """
         with sqlite3.connect(self.db_path) as conn:
+            # Create table if it doesn't exist
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS migration_log (
                     id             INTEGER PRIMARY KEY AUTOINCREMENT,
                     batch_id       TEXT    NOT NULL,
                     attempt_number INTEGER NOT NULL DEFAULT 1,
-                    an8            INTEGER NOT NULL,
+                    an8            INTEGER,
+                    entity_type    TEXT    NOT NULL DEFAULT 'customer',
+                    entity_id      TEXT,
                     run_at         TEXT    NOT NULL,
                     status         TEXT    NOT NULL,
                     odoo_id        INTEGER,
                     error          TEXT,
-                    record_name    TEXT,
-                    UNIQUE(batch_id, an8)
+                    record_name    TEXT
                 )
             """)
+
+            # Migrate existing databases — add columns if missing.
+            # sqlite3 doesn't support IF NOT EXISTS on ALTER TABLE,
+            # so we catch the OperationalError when column already exists.
+            for column, definition in [
+                ("entity_type", "TEXT NOT NULL DEFAULT 'customer'"),
+                ("entity_id",   "TEXT"),
+            ]:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE migration_log ADD COLUMN {column} {definition}"
+                    )
+                    logger.info(f"Migration log: added column '{column}'")
+                except Exception:
+                    pass  # Column already exists — safe to ignore
+
+            # Backfill entity_id from an8 for existing customer records.
+            # This ensures historical F0101 records remain queryable
+            # using the new entity_id column.
+            conn.execute("""
+                UPDATE migration_log
+                SET entity_id = CAST(an8 AS TEXT),
+                    entity_type = 'customer'
+                WHERE entity_id IS NULL AND an8 IS NOT NULL
+            """)
+
             conn.commit()
         logger.info(f"Transaction log ready | path: {self.db_path}")
 

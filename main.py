@@ -49,8 +49,8 @@ Examples:
     parser.add_argument(
         "--table",
         required=True,
-        choices=["customers"],
-        help="Which JDE table to migrate. Currently supports: customers",
+        choices=["customers", "items"],
+        help="Which JDE table to migrate. Supports: customers, items",
     )
 
     parser.add_argument(
@@ -211,6 +211,24 @@ def run_customer_migration(args, settings) -> int:
         logger.error(f"Pipeline failed: {e}")
         return 1
 
+def run_item_migration(args, settings) -> int:
+    """
+    Execute the full item migration pipeline.
+    Extract → Transform → Validate → Load → Report
+    Phase 3 — not yet implemented.
+
+    Args:
+        args:     Parsed argparse namespace with CLI flags.
+        settings: Settings instance from get_settings().
+
+    Returns:
+        int: Exit code. 0 = success, 1 = failure.
+    """
+    logger.error(
+        "Item migration (F4101 → product.template) is not yet implemented. "
+        "This will be built in Phase 3."
+    )
+    return 1
 
 def main():
     """
@@ -239,6 +257,8 @@ def main():
 
     if args.table == "customers":
         exit_code = run_customer_migration(args, settings)
+    elif args.table == "items":
+        exit_code = run_item_migration(args, settings)
     else:
         logger.error(f"Unknown table: {args.table}")
         exit_code = 1
