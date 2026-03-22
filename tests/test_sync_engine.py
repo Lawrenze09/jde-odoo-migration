@@ -1,204 +1,348 @@
 """
 tests/test_sync_engine.py
 
-Tests for SyncEngine — outcome classification and watermark computation.
-Uses tmp_path for isolated SQLite databases so tests never affect the
-real logs/transaction_log.db file.
+Tests for SyncEngine — pipeline-driven orchestration, NO_OP detection,
+outcome classification, and watermark advancement.
 
-OdooLoader and MockExtractor are not called in most tests — we test
-the engine's orchestration logic and outcome mapping in isolation.
+Uses mock pipelines so tests never require a live Odoo connection,
+real extractors, or any domain-specific logic. SyncEngine is tested
+in complete isolation from all pipeline implementations.
 """
 
 import pytest
-import csv
-import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock
 from sync.sync_engine import SyncEngine, SyncOutcome, SyncResult
-from sync.sync_log import SyncLog
-from loaders.odoo_loader import LoadResult, LoadStatus, RecordResult
+from sync.sync_log import SyncWatermark
+from loaders.odoo_loader import LoadResult
 
 
-@pytest.fixture
-def temp_db(tmp_path):
-    """Return a path to a temporary SQLite database."""
-    return str(tmp_path / "test_sync.db")
+def make_load_result(
+    loaded=0, failed=0, not_processed=0, skipped=0
+) -> LoadResult:
+    """Build a LoadResult with specified counts."""
+    r = LoadResult(
+        batch_id="test-batch",
+        total=loaded + failed + not_processed + skipped
+    )
+    r.loaded        = loaded
+    r.failed        = failed
+    r.not_processed = not_processed
+    r.skipped       = skipped
+    return r
 
 
-@pytest.fixture
-def temp_csv(tmp_path):
+def make_watermark(table_name="customers", upmj=0, upmt=0) -> SyncWatermark:
+    """Build a SyncWatermark with optional fields defaulted."""
+    return SyncWatermark(
+        table_name=table_name,
+        last_upmj=upmj,
+        last_upmt=upmt,
+        last_run_at=None,
+        records_synced=0,
+    )
+
+
+def make_mock_pipeline(
+    table_name: str = "customers",
+    records: list | None = None,
+    load_result: LoadResult | None = None,
+) -> MagicMock:
     """
-    Create a minimal mock CSV with two records newer than watermark 126072/28800.
-    AN8=1020: UPMJ=126073 (newer date)
-    AN8=1021: UPMJ=126072, UPMT=36000 (same date, later time)
+    Build a mock pipeline that implements the BasePipeline interface.
+    SyncEngine never calls concrete pipeline methods directly —
+    it always goes through extractor, transformer, validator, loader.
     """
-    csv_path = str(tmp_path / "F0101.csv")
-    rows = [
-        {
-            "AN8": "1020", "ALPH": "Robinsons Galleria", "AT1": "C",
-            "PH1": "09301234567", "ADD1": "Ortigas Center", "ADD2": "",
-            "CTY1": "Pasig City", "ADDS": "00", "ADDZ": "1605",
-            "COUN": "PHL", "TAX": "300400500600", "PA8": "0",
-            "UPMJ": "126073", "UPMT": "32400",
-        },
-        {
-            "AN8": "1021", "ALPH": "SM City Cebu", "AT1": "C",
-            "PH1": "09321234567", "ADD1": "North Reclamation Area", "ADD2": "",
-            "CTY1": "Cebu City", "ADDS": "07", "ADDZ": "6000",
-            "COUN": "PHL", "TAX": "400500600700", "PA8": "0",
-            "UPMJ": "126072", "UPMT": "36000",
-        },
-    ]
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        writer.writeheader()
-        writer.writerows(rows)
-    return csv_path
+    records     = records or []
+    load_result = load_result or make_load_result(loaded=len(records))
+
+    pipeline = MagicMock()
+    pipeline.table_name = table_name
+    pipeline.describe.return_value = f"MockPipeline ({table_name})"
+
+    # Extractor returns the provided records
+    pipeline.extractor.extract.return_value = records
+
+    # Transformer returns records unchanged
+    pipeline.transformer.transform_batch.side_effect = lambda r: r
+
+    # Validator passes all records as valid
+    pipeline.validator.validate_batch.side_effect = lambda r: (r, [])
+
+    # Loader returns the provided load result
+    pipeline.loader.load.return_value = load_result
+
+    # compute_watermark returns a zero watermark by default
+    pipeline.compute_watermark.return_value = make_watermark(table_name)
+
+    return pipeline
+
+
+# ── Sample records for watermark tests ───────────────────────────────────────
+SAMPLE_RECORDS = [
+    {"AN8": "1001", "UPMJ": "126070", "UPMT": "28800"},
+    {"AN8": "1002", "UPMJ": "126072", "UPMT": "36000"},
+    {"AN8": "1003", "UPMJ": "126073", "UPMT": "14400"},
+]
 
 
 class TestSyncEngineNoOp:
-    def test_no_op_when_watermark_is_current(self, temp_db, temp_csv):
-        """
-        When watermark equals the max UPMJ/UPMT in the CSV,
-        the extractor returns 0 records and outcome is NO_OP.
-        """
-        # Set watermark ahead of all records in the CSV
-        sync_log = SyncLog(db_path=temp_db)
-        sync_log.update_watermark("F0101", last_upmj=126999, last_upmt=99999, records_synced=0)
-
-        engine = SyncEngine(source="mock", dry_run=True, generate_report=False)
-        engine.sync_log = sync_log
-
-        with patch("sync.sync_engine.MockExtractor") as MockExt:
-            mock_instance = MagicMock()
-            mock_instance.extract.return_value = []
-            MockExt.return_value = mock_instance
-
-            result = engine.run()
-
+    def test_no_op_when_no_records_extracted(self, tmp_path):
+        """Zero extracted records must return NO_OP immediately."""
+        pipeline = make_mock_pipeline(records=[])
+        engine   = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
         assert result.outcome == SyncOutcome.NO_OP
-        assert result.records_extracted == 0
-        assert result.message == "No new or updated records — sync is up to date"
 
-    def test_no_op_exit_code_is_zero(self, temp_db):
-        """NO_OP should map to exit code 0 — not a failure."""
-        failed_outcomes = {SyncOutcome.FAILED, SyncOutcome.PARTIAL}
-        assert SyncOutcome.NO_OP not in failed_outcomes
+    def test_no_op_exit_code_is_zero(self, tmp_path):
+        """NO_OP must return exit code 0 — not a failure."""
+        pipeline = make_mock_pipeline(records=[])
+        engine   = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.exit_code == 0
+
+    def test_no_op_does_not_call_transformer(self, tmp_path):
+        """Transformer must not be called when zero records extracted."""
+        pipeline = make_mock_pipeline(records=[])
+        engine   = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        engine.run()
+        pipeline.transformer.transform_batch.assert_not_called()
+
+    def test_no_op_does_not_call_loader(self, tmp_path):
+        """Loader must not be called when zero records extracted."""
+        pipeline = make_mock_pipeline(records=[])
+        engine   = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        engine.run()
+        pipeline.loader.load.assert_not_called()
+
+    def test_no_op_watermark_not_advanced(self, tmp_path):
+        """Watermark must not be advanced on NO_OP."""
+        pipeline = make_mock_pipeline(records=[])
+        engine   = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.watermark_after is None
 
 
 class TestSyncOutcomeClassification:
-    def test_classify_failed_when_failed_gt_zero(self):
-        """Any Odoo failure → FAILED outcome."""
-        engine = SyncEngine(source="mock", dry_run=False, generate_report=False)
-        load_result = LoadResult(batch_id="test", total=5, loaded=3, failed=1)
-        assert engine._classify_outcome(load_result) == SyncOutcome.FAILED
+    def test_classify_failed_when_failed_gt_zero_no_not_processed(self, tmp_path):
+        """failed > 0 and not_processed == 0 → FAILED."""
+        load_result = make_load_result(loaded=3, failed=1, not_processed=0)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.outcome == SyncOutcome.FAILED
 
-    def test_classify_partial_when_not_processed_gt_zero(self):
-        """Any NOT_PROCESSED records → PARTIAL outcome."""
-        engine = SyncEngine(source="mock", dry_run=False, generate_report=False)
-        load_result = LoadResult(batch_id="test", total=5, loaded=3, not_processed=2)
-        assert engine._classify_outcome(load_result) == SyncOutcome.PARTIAL
+    def test_classify_partial_when_failed_and_not_processed(self, tmp_path):
+        """failed > 0 AND not_processed > 0 → PARTIAL (batch stopped mid-run)."""
+        load_result = make_load_result(loaded=2, failed=1, not_processed=3)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.outcome == SyncOutcome.PARTIAL
 
-    def test_classify_success_with_skips(self):
-        """Loaded > 0 and skipped > 0 → SUCCESS_WITH_SKIPS."""
-        engine = SyncEngine(source="mock", dry_run=False, generate_report=False)
-        load_result = LoadResult(batch_id="test", total=5, loaded=3, skipped=2)
-        assert engine._classify_outcome(load_result) == SyncOutcome.SUCCESS_WITH_SKIPS
+    def test_classify_success_with_skips(self, tmp_path):
+        """loaded > 0 and skipped > 0 → SUCCESS_WITH_SKIPS."""
+        load_result = make_load_result(loaded=2, skipped=1)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.outcome == SyncOutcome.SUCCESS_WITH_SKIPS
 
-    def test_classify_success_clean(self):
-        """Loaded > 0, nothing else → SUCCESS."""
-        engine = SyncEngine(source="mock", dry_run=False, generate_report=False)
-        load_result = LoadResult(batch_id="test", total=3, loaded=3)
-        assert engine._classify_outcome(load_result) == SyncOutcome.SUCCESS
+    def test_classify_success_with_skips_when_all_skipped(self, tmp_path):
+        """All skipped and none loaded → SUCCESS_WITH_SKIPS, not NO_OP."""
+        load_result = make_load_result(loaded=0, skipped=3)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.outcome == SyncOutcome.SUCCESS_WITH_SKIPS
 
-    def test_classify_no_op_when_all_skipped(self):
-        """Nothing loaded, all skipped → NO_OP."""
-        engine = SyncEngine(source="mock", dry_run=False, generate_report=False)
-        load_result = LoadResult(batch_id="test", total=3, skipped=3)
-        assert engine._classify_outcome(load_result) == SyncOutcome.NO_OP
+    def test_classify_success_clean(self, tmp_path):
+        """All loaded, no failures, no skips → SUCCESS."""
+        load_result = make_load_result(loaded=3)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.outcome == SyncOutcome.SUCCESS
+
+    def test_failed_exit_code_is_one(self, tmp_path):
+        """FAILED outcome must return exit code 1."""
+        load_result = make_load_result(loaded=0, failed=3)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.exit_code == 1
+
+    def test_partial_exit_code_is_one(self, tmp_path):
+        """PARTIAL outcome must return exit code 1."""
+        load_result = make_load_result(loaded=1, failed=1, not_processed=2)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.exit_code == 1
+
+    def test_success_exit_code_is_zero(self, tmp_path):
+        """SUCCESS outcome must return exit code 0."""
+        load_result = make_load_result(loaded=3)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.exit_code == 0
 
 
-class TestComputeNewWatermark:
-    def test_watermark_advances_to_max_upmj(self, temp_db):
-        """New watermark should be the maximum UPMJ seen in the batch."""
-        engine = SyncEngine(source="mock", dry_run=True, generate_report=False)
-        engine.sync_log = SyncLog(db_path=temp_db)
+class TestWatermarkAdvancement:
+    def test_watermark_advances_on_success(self, tmp_path):
+        """Watermark must advance after successful load."""
+        load_result = make_load_result(loaded=3)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        pipeline.compute_watermark.return_value = make_watermark(
+            table_name="customers",
+            upmj=126073,
+            upmt=14400,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.watermark_after is not None
+        assert result.watermark_after.last_upmj == 126073
 
-        from sync.sync_log import SyncWatermark
-        current = SyncWatermark("F0101", 126070, 28800, None, 0)
+    def test_watermark_not_advanced_on_failure(self, tmp_path):
+        """Watermark must NOT advance when any record fails."""
+        load_result = make_load_result(loaded=2, failed=1)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.watermark_after is None
 
-        records = [
-            {"AN8": "1001", "UPMJ": "126072", "UPMT": "28800"},
-            {"AN8": "1002", "UPMJ": "126073", "UPMT": "32400"},
-            {"AN8": "1003", "UPMJ": "126071", "UPMT": "36000"},
-        ]
-
-        new_upmj, new_upmt = engine._compute_new_watermark(records, current)
-        assert new_upmj == 126073
-        assert new_upmt == 32400
-
-    def test_watermark_uses_max_upmt_for_same_upmj(self, temp_db):
-        """When multiple records share max UPMJ, use the max UPMT."""
-        engine = SyncEngine(source="mock", dry_run=True, generate_report=False)
-        engine.sync_log = SyncLog(db_path=temp_db)
-
-        from sync.sync_log import SyncWatermark
-        current = SyncWatermark("F0101", 126070, 0, None, 0)
-
-        records = [
-            {"AN8": "1001", "UPMJ": "126072", "UPMT": "28800"},
-            {"AN8": "1002", "UPMJ": "126072", "UPMT": "36000"},
-            {"AN8": "1003", "UPMJ": "126072", "UPMT": "14400"},
-        ]
-
-        new_upmj, new_upmt = engine._compute_new_watermark(records, current)
-        assert new_upmj == 126072
-        assert new_upmt == 36000
-
-    def test_watermark_unchanged_when_records_have_no_upmj(self, temp_db):
-        """Records with missing UPMJ should not change the watermark."""
-        engine = SyncEngine(source="mock", dry_run=True, generate_report=False)
-        engine.sync_log = SyncLog(db_path=temp_db)
-
-        from sync.sync_log import SyncWatermark
-        current = SyncWatermark("F0101", 126072, 28800, None, 0)
-
-        records = [
-            {"AN8": "1001", "UPMJ": "", "UPMT": ""},
-            {"AN8": "1002", "UPMJ": None, "UPMT": None},
-        ]
-
-        new_upmj, new_upmt = engine._compute_new_watermark(records, current)
-        assert new_upmj == 126072
-        assert new_upmt == 28800
+    def test_compute_watermark_delegated_to_pipeline(self, tmp_path):
+        """SyncEngine must delegate watermark computation to the pipeline."""
+        load_result = make_load_result(loaded=3)
+        pipeline    = make_mock_pipeline(
+            records=SAMPLE_RECORDS,
+            load_result=load_result,
+        )
+        engine = SyncEngine(
+            pipeline=pipeline,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        engine.run()
+        pipeline.compute_watermark.assert_called_once()
 
 
 class TestDryRunOutcome:
-    def test_dry_run_never_calls_odoo_loader(self, temp_db):
-        """Dry run must not instantiate OdooLoader under any circumstances."""
-        engine = SyncEngine(source="mock", dry_run=True, generate_report=False)
-        engine.sync_log = SyncLog(db_path=temp_db)
+    def test_dry_run_returns_dry_run_outcome(self, tmp_path):
+        """Dry run must return DRY_RUN outcome regardless of records."""
+        pipeline = make_mock_pipeline(records=SAMPLE_RECORDS)
+        engine   = SyncEngine(
+            pipeline=pipeline,
+            dry_run=True,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.outcome == SyncOutcome.DRY_RUN
 
-        with patch("sync.sync_engine.MockExtractor") as MockExt, \
-             patch("sync.sync_engine.OdooLoader") as MockLoader:
+    def test_dry_run_never_calls_loader(self, tmp_path):
+        """Loader must never be called in dry run mode."""
+        pipeline = make_mock_pipeline(records=SAMPLE_RECORDS)
+        engine   = SyncEngine(
+            pipeline=pipeline,
+            dry_run=True,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        engine.run()
+        pipeline.loader.load.assert_not_called()
 
-            mock_instance = MagicMock()
-            mock_instance.extract.return_value = []
-            MockExt.return_value = mock_instance
+    def test_dry_run_exit_code_is_zero(self, tmp_path):
+        """Dry run must always return exit code 0."""
+        pipeline = make_mock_pipeline(records=SAMPLE_RECORDS)
+        engine   = SyncEngine(
+            pipeline=pipeline,
+            dry_run=True,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.exit_code == 0
 
-            engine.run()
-            MockLoader.assert_not_called()
-
-    def test_dry_run_outcome_is_no_op_when_nothing_extracted(self, temp_db):
-        """Dry run with zero extracted records returns NO_OP not DRY_RUN."""
-        engine = SyncEngine(source="mock", dry_run=True, generate_report=False)
-        engine.sync_log = SyncLog(db_path=temp_db)
-
-        with patch("sync.sync_engine.MockExtractor") as MockExt:
-            mock_instance = MagicMock()
-            mock_instance.extract.return_value = []
-            MockExt.return_value = mock_instance
-
-            result = engine.run()
-
-        assert result.outcome == SyncOutcome.NO_OP
+    def test_dry_run_watermark_not_advanced(self, tmp_path):
+        """Watermark must not advance in dry run mode."""
+        pipeline = make_mock_pipeline(records=SAMPLE_RECORDS)
+        engine   = SyncEngine(
+            pipeline=pipeline,
+            dry_run=True,
+            sync_log_path=str(tmp_path / "sync.db")
+        )
+        result = engine.run()
+        assert result.watermark_after is None
         

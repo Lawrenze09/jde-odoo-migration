@@ -12,6 +12,8 @@ Usage examples:
     python main.py --table customers --source mock --report
     python main.py --table items --source mock --dry-run --report
     python main.py --table items --source mock --report
+    python main.py --table customers --sync --dry-run
+    python main.py --table items --sync --dry-run
 
 Flags:
     --table     Which table to migrate. Supports: customers, items
@@ -48,6 +50,8 @@ Examples:
   python main.py --table customers --source mock --report
   python main.py --table items --source mock --dry-run --report
   python main.py --table items --source mock --report
+  python main.py --table customers --sync --dry-run
+  python main.py --table items --sync --dry-run
         """,
     )
 
@@ -217,7 +221,7 @@ def run_item_migration(args, settings) -> int:
     Execute the full item migration pipeline.
     Extract → Transform → Validate → Load (or dry run) → Report
 
-    UomRegistry is always built against live Odoo — even in dry run mode.
+    UomRegistry always connects to Odoo — even in dry run mode.
     UOM validation must be accurate regardless of whether data is written.
     Only Stage 4 (Load) is skipped in dry run mode.
 
@@ -265,9 +269,6 @@ def run_item_migration(args, settings) -> int:
         transformed = transformer.transform_batch(records)
 
         # ── Stage 3: Build UomRegistry + Validate ────────────────────
-        # UomRegistry always connects to Odoo — even in dry run.
-        # UOM validation must be accurate regardless of whether data is written.
-        # The registry is shared with ItemLoader in live run mode.
         logger.info("STAGE 3 — Validate")
 
         from loaders.uom_registry import UomRegistry
@@ -276,7 +277,9 @@ def run_item_migration(args, settings) -> int:
         url    = settings.odoo_url
         db     = settings.odoo_db
         common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
-        uid    = common.authenticate(db, settings.odoo_username, settings.odoo_password, {})
+        uid    = common.authenticate(
+            db, settings.odoo_username, settings.odoo_password, {}
+        )
         models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
         uom_registry = UomRegistry(models, uid, settings.odoo_password, db)
 
@@ -355,8 +358,27 @@ def main():
 
     if args.sync:
         from sync.sync_engine import SyncEngine, SyncOutcome
+
+        if args.table == "customers":
+            from pipelines.customer_pipeline import CustomerPipeline
+            pipeline = CustomerPipeline(
+                source=args.source,
+                dry_run=args.dry_run,
+                limit=args.limit,
+            )
+        elif args.table == "items":
+            from pipelines.item_pipeline import ItemPipeline
+            pipeline = ItemPipeline(
+                source=args.source,
+                dry_run=args.dry_run,
+                limit=args.limit,
+            )
+        else:
+            logger.error(f"Unknown table: {args.table}")
+            sys.exit(1)
+
         engine = SyncEngine(
-            source=args.source,
+            pipeline=pipeline,
             dry_run=args.dry_run,
             generate_report=args.report,
             limit=args.limit,

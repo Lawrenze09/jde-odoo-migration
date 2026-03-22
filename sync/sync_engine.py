@@ -1,43 +1,31 @@
 """
 sync/sync_engine.py
 
-Role in pipeline: Orchestrator for incremental sync runs.
-Coordinates all Phase 2 components in sequence:
-    1. Read watermark from sync log
-    2. Extract only records updated after the watermark (UPMJ+UPMT filter)
-    3. Transform extracted records
-    4. Validate transformed records
-    5. Resolve conflicts for records that already exist in Odoo
-    6. Load valid records to Odoo atomically
-    7. Update watermark in sync log
-    8. Generate reconciliation report
+Domain-agnostic sync orchestrator.
 
-Returns a SyncResult dataclass — rich enough for reporting and observability.
-The CLI layer maps SyncResult.outcome to an exit code for scheduler compatibility.
+SyncEngine owns cross-cutting orchestration:
+    - Watermark read from SyncLog
+    - Delegates to pipeline for extract/transform/validate/load
+    - NO_OP detection (zero records extracted)
+    - Watermark persistence after successful run
+    - Outcome classification
+    - Run reporting trigger
 
-Outcome values:
-    SUCCESS          — records created, no failures
-    SUCCESS_WITH_SKIPS — some created, some already existed
-    NO_OP            — nothing to process, watermark is current
-    FAILED           — batch stopped due to Odoo rejection
-    PARTIAL          — some records not processed
-    DRY_RUN          — no Odoo writes attempted
+SyncEngine never knows:
+    - JDE table names or column prefixes
+    - UomRegistry or any domain registry
+    - Odoo model names (res.partner, product.template)
+    - Business validation rules
+
+These are all owned by the pipeline passed at construction time.
+Adding a new table = create a new pipeline, zero changes to SyncEngine.
 """
 
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
 from enum import Enum
-
-from extractors.mock_extractor import MockExtractor
-from transformers.customer_transformer import CustomerTransformer
-from validators.customer_validator import CustomerValidator
-from loaders.odoo_loader import OdooLoader, LoadResult
-from loaders.csv_loader import CsvLoader
-from sync.sync_log import SyncLog
-from sync.conflict_resolver import ConflictResolver, ConflictStrategy
-from reports.migration_report import MigrationReport
-from config.settings import get_settings
+from pipelines.base_pipeline import BasePipeline
+from sync.sync_log import SyncLog, SyncWatermark
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -45,411 +33,278 @@ logger = get_logger(__name__)
 
 class SyncOutcome(Enum):
     """
-    Overall outcome of a sync engine run.
-    The CLI layer maps these to exit codes:
-        SUCCESS, SUCCESS_WITH_SKIPS, NO_OP, DRY_RUN → exit 0
-        FAILED, PARTIAL                              → exit 1
+    Classification of a sync run's final state.
+
+    SUCCESS            — all extracted records loaded cleanly
+    SUCCESS_WITH_SKIPS — loaded + some skipped (already existed)
+    NO_OP              — zero records extracted since last watermark
+    FAILED             — at least one record failed, no not_processed
+    PARTIAL            — batch stopped mid-run (failed + not_processed)
+    DRY_RUN            — dry run mode, no data written
     """
-    SUCCESS           = "SUCCESS"
+    SUCCESS            = "SUCCESS"
     SUCCESS_WITH_SKIPS = "SUCCESS_WITH_SKIPS"
-    NO_OP             = "NO_OP"
-    FAILED            = "FAILED"
-    PARTIAL           = "PARTIAL"
-    DRY_RUN           = "DRY_RUN"
+    NO_OP              = "NO_OP"
+    FAILED             = "FAILED"
+    PARTIAL            = "PARTIAL"
+    DRY_RUN            = "DRY_RUN"
 
 
 @dataclass
 class SyncResult:
     """
-    Rich result object returned by SyncEngine.run().
-    Contains everything needed for reporting, logging, and exit code mapping.
+    Full observability for a single sync run.
 
     Attributes:
-        outcome:          Overall sync outcome — maps to exit code in CLI
-        table_name:       JDE table that was synced e.g. 'F0101'
-        source:           Data source used e.g. 'mock' or 'oracle'
-        dry_run:          True if no data was written to Odoo
-        records_extracted: Total records returned by the extractor
-        records_valid:    Records that passed all validation rules
-        records_failed:   Records that failed validation
-        records_loaded:   Records successfully created in Odoo
-        records_skipped:  Records already in Odoo — not re-created
-        records_not_processed: Records skipped because batch stopped
-        last_upmj:        Julian date watermark from this run
-        last_upmt:        Time watermark from this run
-        duration_ms:      Total run duration in milliseconds
-        report_path:      Path to generated Excel report, or None
-        load_result:      Full LoadResult from OdooLoader, or None
-        failed_records:   Records that failed validation (for report)
-        valid_records:    Records that passed validation (for report)
-        run_at:           ISO timestamp when sync started
-        message:          Plain English summary of what happened
+        outcome:           Final classification of this run
+        table_name:        Pipeline table identifier e.g. 'customers'
+        records_extracted: How many records came from the extractor
+        records_valid:     How many passed validation
+        records_failed:    How many failed validation
+        records_loaded:    How many were written to Odoo
+        records_skipped:   How many were skipped (already loaded)
+        not_processed:     How many were not attempted (batch stopped)
+        watermark_before:  Watermark at start of run
+        watermark_after:   Watermark at end of run (None if not advanced)
+        duration_seconds:  Wall clock time for the run
+        exit_code:         0 = success/no-op, 1 = failure
+        message:           Human-readable summary
     """
-    outcome:              SyncOutcome
-    table_name:           str
-    source:               str
-    dry_run:              bool
-    records_extracted:    int = 0
-    records_valid:        int = 0
-    records_failed:       int = 0
-    records_loaded:       int = 0
-    records_skipped:      int = 0
-    records_not_processed: int = 0
-    last_upmj:            int = 0
-    last_upmt:            int = 0
-    duration_ms:          int = 0
-    report_path:          str | None = None
-    load_result:          LoadResult | None = None
-    failed_records:       list[dict] = field(default_factory=list)
-    valid_records:        list[dict] = field(default_factory=list)
-    run_at:               str = ""
-    message:              str = ""
+    outcome:           SyncOutcome       = SyncOutcome.NO_OP
+    table_name:        str               = ""
+    records_extracted: int               = 0
+    records_valid:     int               = 0
+    records_failed:    int               = 0
+    records_loaded:    int               = 0
+    records_skipped:   int               = 0
+    not_processed:     int               = 0
+    watermark_before:  SyncWatermark | None = None
+    watermark_after:   SyncWatermark | None = None
+    duration_seconds:  float             = 0.0
+    exit_code:         int               = 0
+    message:           str               = ""
 
 
 class SyncEngine:
     """
-    Orchestrates incremental sync from JDE to Odoo.
-    Reads watermark → extracts delta → transforms → validates →
-    resolves conflicts → loads → updates watermark → reports.
+    Domain-agnostic sync orchestrator.
 
-    Safe to run on a schedule — NO_OP outcome when nothing has changed.
+    Accepts any pipeline that implements BasePipeline.
+    Orchestrates watermark, extraction, transformation, validation,
+    loading, outcome classification, and optional reporting.
+
+    To add a new table: create a new Pipeline class.
+    SyncEngine requires zero changes.
     """
-
-    # JDE table name for the sync log — matches F0101 Address Book
-    JDE_TABLE = "F0101"
 
     def __init__(
         self,
-        source: str = "mock",
-        dry_run: bool = True,
-        conflict_strategy: ConflictStrategy = ConflictStrategy.JDE_WINS,
-        generate_report: bool = True,
+        pipeline: BasePipeline,
+        dry_run: bool = False,
+        generate_report: bool = False,
         limit: int | None = None,
+        sync_log_path: str = "logs/transaction_log.db",
     ):
         """
-        Initialize the SyncEngine with run configuration.
+        Initialize SyncEngine with a configured pipeline.
 
         Args:
-            source            (str):  Data source — 'mock' or 'oracle'
-            dry_run           (bool): True = no Odoo writes, preview only
-            conflict_strategy:        How to handle records that already exist
-                                      in Odoo with different data
-            generate_report   (bool): Whether to generate Excel report
-            limit       (int|None):   Max records to process (None = all)
+            pipeline:        Configured pipeline (CustomerPipeline, ItemPipeline, etc.)
+            dry_run:         If True, skip Odoo writes and report DRY_RUN outcome.
+            generate_report: If True, generate Excel report after run.
+            limit:           Optional record limit for debugging only.
+            sync_log_path:   Path to SQLite sync log database.
         """
-        self.settings          = get_settings()
-        self.source            = source
-        self.dry_run           = dry_run
-        self.conflict_strategy = conflict_strategy
-        self.generate_report   = generate_report
-        self.limit             = limit
-        self.sync_log          = SyncLog()
+        self.pipeline        = pipeline
+        self.dry_run         = dry_run
+        self.generate_report = generate_report
+        self.limit           = limit
+        self.sync_log        = SyncLog(db_path=sync_log_path)
 
         logger.info(
-            f"SyncEngine initialized | "
-            f"source: {source} | "
-            f"dry_run: {dry_run} | "
-            f"strategy: {conflict_strategy.value}"
+            f"SyncEngine ready | "
+            f"pipeline: {pipeline.describe()} | "
+            f"dry_run: {dry_run}"
         )
 
     def run(self) -> SyncResult:
         """
-        Execute the full incremental sync pipeline.
+        Execute one full sync cycle through the pipeline.
+
+        Flow:
+            1. Read watermark from SyncLog
+            2. Extract records since watermark (delegates to pipeline)
+            3. If zero records → NO_OP, return immediately
+            4. Transform → Validate → Load
+            5. Advance watermark on success
+            6. Classify outcome
+            7. Optional report generation
 
         Returns:
-            SyncResult: Rich result object with counts, outcome, duration,
-                        and report path. Never raises — all exceptions are
-                        caught and reflected in SyncResult.outcome = FAILED.
+            SyncResult: Full observability for this run.
         """
         start_time = time.time()
-        run_at     = datetime.now().isoformat()
-
-        logger.info("=" * 60)
-        logger.info("SYNC START")
-        logger.info(f"Timestamp:  {run_at}")
-        logger.info(f"Source:     {self.source}")
-        logger.info(f"Dry run:    {self.dry_run}")
-        logger.info(f"Strategy:   {self.conflict_strategy.value}")
-        logger.info("=" * 60)
-
-        try:
-            return self._run_pipeline(start_time, run_at)
-        except Exception as e:
-            duration_ms = int((time.time() - start_time) * 1000)
-            logger.error(f"Sync engine failed with unhandled exception: {e}")
-            return SyncResult(
-                outcome=SyncOutcome.FAILED,
-                table_name=self.JDE_TABLE,
-                source=self.source,
-                dry_run=self.dry_run,
-                duration_ms=duration_ms,
-                run_at=run_at,
-                message=f"Sync failed: {str(e)}",
-            )
-
-    def _run_pipeline(self, start_time: float, run_at: str) -> SyncResult:
-        """
-        Internal pipeline execution — called by run() inside try/except.
-
-        Args:
-            start_time (float): Unix timestamp when run started
-            run_at     (str):   ISO timestamp string for the result
-
-        Returns:
-            SyncResult: Complete result with all counts and outcome.
-        """
-        settings = self.settings
+        table_name = self.pipeline.table_name
+        result     = SyncResult(table_name=table_name)
 
         # ── Step 1: Read watermark ────────────────────────────────────
-        watermark = self.sync_log.get_watermark(self.JDE_TABLE)
+        watermark = self.sync_log.get_watermark(table_name)
+        result.watermark_before = watermark
+
         logger.info(
-            f"WATERMARK | table: {self.JDE_TABLE} | "
-            f"last_upmj: {watermark.last_upmj} | "
-            f"last_upmt: {watermark.last_upmt} | "
-            f"last_run: {watermark.last_run_at or 'never'}"
+            f"SyncEngine starting | "
+            f"pipeline: {self.pipeline.describe()} | "
+            f"watermark: UPMJ={watermark.last_upmj} UPMT={watermark.last_upmt}"
         )
 
-        # ── Step 2: Extract delta ─────────────────────────────────────
-        logger.info("STAGE 1 — Extract")
-
-        if self.source == "mock":
-            extractor = MockExtractor()
-        else:
-            logger.error("Oracle source not yet implemented. Use source='mock'.")
-            return SyncResult(
-                outcome=SyncOutcome.FAILED,
-                table_name=self.JDE_TABLE,
-                source=self.source,
-                dry_run=self.dry_run,
-                run_at=run_at,
-                message="Oracle source not yet implemented.",
-            )
-
-        records = extractor.extract(
+        # ── Step 2: Extract ───────────────────────────────────────────
+        # Pipeline extractor owns incremental filtering.
+        # SyncEngine passes watermark values — never interprets them.
+        records = self.pipeline.extractor.extract(
             last_upmj=watermark.last_upmj,
             last_upmt=watermark.last_upmt,
         )
 
         if self.limit:
             records = records[:self.limit]
-            logger.info(f"Limit applied — processing {len(records)} records")
-
-        logger.info(f"EXTRACT RESULT | records_found: {len(records)}")
-
-        # ── NO_OP: nothing to process ─────────────────────────────────
-        if len(records) == 0:
-            duration_ms = int((time.time() - start_time) * 1000)
-            logger.info(f"NO_OP | No new or updated records detected — sync complete")
-            logger.info(f"SYNC END | duration: {duration_ms}ms")
-            return SyncResult(
-                outcome=SyncOutcome.NO_OP,
-                table_name=self.JDE_TABLE,
-                source=self.source,
-                dry_run=self.dry_run,
-                records_extracted=0,
-                last_upmj=watermark.last_upmj,
-                last_upmt=watermark.last_upmt,
-                duration_ms=duration_ms,
-                run_at=run_at,
-                message="No new or updated records — sync is up to date",
+            logger.warning(
+                f"LIMIT applied: {self.limit} records. "
+                f"Watermark will reflect truncated batch — "
+                f"use limit for debugging only, never in production sync."
             )
 
-        # ── Step 3: Transform ─────────────────────────────────────────
-        logger.info("STAGE 2 — Transform")
-        transformer  = CustomerTransformer()
-        transformed  = transformer.transform_batch(records)
+        result.records_extracted = len(records)
 
-        # ── Step 4: Validate ──────────────────────────────────────────
-        logger.info("STAGE 3 — Validate")
-        validator    = CustomerValidator()
-        valid_records, failed_records = validator.validate_batch(transformed)
+        # ── Step 3: NO_OP check ───────────────────────────────────────
+        if len(records) == 0:
+            result.outcome          = SyncOutcome.NO_OP
+            result.exit_code        = 0
+            result.duration_seconds = time.time() - start_time
+            result.message          = (
+                f"No new or updated records since last watermark "
+                f"(UPMJ={watermark.last_upmj}, UPMT={watermark.last_upmt})"
+            )
+            logger.info(f"NO_OP | {result.message}")
+            return result
 
-        # ── Compute new watermark from this batch ─────────────────────
-        # Use the maximum UPMJ/UPMT seen in this batch so the next run
-        # starts from the most recent record we processed.
-        new_upmj, new_upmt = self._compute_new_watermark(records, watermark)
+        # ── Step 4: Transform ─────────────────────────────────────────
+        transformed = self.pipeline.transformer.transform_batch(records)
 
-        # ── Step 5: Load ──────────────────────────────────────────────
-        logger.info("STAGE 4 — Load")
-        load_result = None
+        # ── Step 5: Validate ──────────────────────────────────────────
+        valid_records, failed_records = self.pipeline.validator.validate_batch(
+            transformed
+        )
+        result.records_valid  = len(valid_records)
+        result.records_failed = len(failed_records)
 
+        # ── Step 6: Load (or dry run) ─────────────────────────────────
         if self.dry_run:
-            logger.info("DRY RUN — writing preview CSV, skipping Odoo")
-            csv_loader = CsvLoader()
-            csv_loader.load(valid_records)
-            csv_loader.load_failed(failed_records)
-            outcome = SyncOutcome.DRY_RUN
+            result.outcome          = SyncOutcome.DRY_RUN
+            result.exit_code        = 0
+            result.duration_seconds = time.time() - start_time
+            result.message          = (
+                f"Dry run — {len(valid_records)} valid, "
+                f"{len(failed_records)} failed. No data written."
+            )
+            logger.info(f"DRY_RUN | {result.message}")
+            return result
+
+        load_result = self.pipeline.loader.load(valid_records)
+        result.records_loaded  = load_result.loaded
+        result.records_skipped = load_result.skipped
+        result.not_processed   = load_result.not_processed
+
+        # ── Step 7: Advance watermark ─────────────────────────────────
+        # Delegate computation to pipeline — SyncEngine must not know
+        # JDE field names like UPMJ or UPMT.
+        # Only advance on non-failed outcomes — preserves re-run safety.
+        new_watermark = self.pipeline.compute_watermark(records, watermark)
+
+        if load_result.failed == 0:
+            self.sync_log.update_watermark(
+                table_name=table_name,
+                last_upmj=new_watermark.last_upmj,
+                last_upmt=new_watermark.last_upmt,
+                records_synced=load_result.loaded,
+            )
+            result.watermark_after = new_watermark
+            logger.info(
+                f"Watermark advanced | "
+                f"UPMJ={new_watermark.last_upmj} "
+                f"UPMT={new_watermark.last_upmt}"
+            )
         else:
-            loader      = OdooLoader()
-            load_result = loader.load(valid_records)
-            outcome     = self._classify_outcome(load_result)
+            logger.warning(
+                f"Watermark NOT advanced — "
+                f"{load_result.failed} failure(s) in batch. "
+                f"Re-run to retry failed records."
+            )
 
-            # ── Step 6: Update watermark ─────────────────────────────
-            # Only update watermark on successful or partial runs.
-            # On FAILED, keep the old watermark so the next run retries
-            # from the same point — no records are missed.
-            if outcome not in (SyncOutcome.FAILED,):
-                self.sync_log.update_watermark(
-                    table_name=self.JDE_TABLE,
-                    last_upmj=new_upmj,
-                    last_upmt=new_upmt,
-                    records_synced=len(records),
-                )
-                logger.info(
-                    f"Watermark updated | "
-                    f"new_upmj: {new_upmj} | new_upmt: {new_upmt}"
-                )
+        # ── Step 8: Classify outcome ──────────────────────────────────
+        result.outcome      = self._classify_outcome(load_result)
+        result.exit_code    = 1 if result.outcome in {
+            SyncOutcome.FAILED, SyncOutcome.PARTIAL
+        } else 0
+        result.duration_seconds = time.time() - start_time
+        result.message          = self._build_message(result)
 
-        # ── Step 7: Report ────────────────────────────────────────────
-        report_path = None
+        # ── Step 9: Optional report ───────────────────────────────────
         if self.generate_report:
-            logger.info("STAGE 5 — Report")
+            self._generate_report(valid_records, failed_records, load_result)
+
+        logger.info(
+            f"SyncEngine complete | "
+            f"outcome: {result.outcome.value} | "
+            f"loaded: {result.records_loaded} | "
+            f"failed: {result.records_failed} | "
+            f"duration: {result.duration_seconds:.2f}s"
+        )
+
+        return result
+
+    # ── Private helpers ──────────────────────────────────────────────────────
+
+    def _classify_outcome(self, load_result) -> SyncOutcome:
+        """
+        Classify the final outcome based on load result counts.
+
+        PARTIAL  — failed > 0 AND not_processed > 0 (batch stopped mid-run)
+        FAILED   — failed > 0 but all were attempted (no not_processed)
+        SUCCESS_WITH_SKIPS — no failures, some skipped
+        SUCCESS  — all loaded cleanly
+        """
+        if load_result.failed > 0 and load_result.not_processed > 0:
+            return SyncOutcome.PARTIAL
+        if load_result.failed > 0:
+            return SyncOutcome.FAILED
+        if load_result.skipped > 0:
+            return SyncOutcome.SUCCESS_WITH_SKIPS
+        return SyncOutcome.SUCCESS
+
+    def _build_message(self, result: SyncResult) -> str:
+        """Build a human-readable summary message for the result."""
+        return (
+            f"{result.outcome.value} | "
+            f"extracted: {result.records_extracted} | "
+            f"valid: {result.records_valid} | "
+            f"loaded: {result.records_loaded} | "
+            f"skipped: {result.records_skipped} | "
+            f"failed: {result.records_failed}"
+        )
+
+    def _generate_report(self, valid_records, failed_records, load_result):
+        """Trigger report generation — delegates to MigrationReport."""
+        try:
+            from reports.migration_report import MigrationReport
             report      = MigrationReport()
             report_path = report.generate(
                 valid_records=valid_records,
                 failed_records=failed_records,
-                dry_run=self.dry_run,
-                source=self.source,
+                dry_run=False,
+                source="sync",
                 load_result=load_result,
             )
-            logger.info(f"Report: {report_path}")
-
-        duration_ms = int((time.time() - start_time) * 1000)
-
-        # ── Build result ──────────────────────────────────────────────
-        result = SyncResult(
-            outcome=outcome,
-            table_name=self.JDE_TABLE,
-            source=self.source,
-            dry_run=self.dry_run,
-            records_extracted=len(records),
-            records_valid=len(valid_records),
-            records_failed=len(failed_records),
-            records_loaded=load_result.loaded if load_result else 0,
-            records_skipped=load_result.skipped if load_result else 0,
-            records_not_processed=load_result.not_processed if load_result else 0,
-            last_upmj=new_upmj,
-            last_upmt=new_upmt,
-            duration_ms=duration_ms,
-            report_path=report_path,
-            load_result=load_result,
-            failed_records=failed_records,
-            valid_records=valid_records,
-            run_at=run_at,
-            message=self._build_message(outcome, load_result, len(records)),
-        )
-
-        logger.info("=" * 60)
-        logger.info(f"SYNC RESULT | status: {outcome.value}")
-        logger.info(f"SYNC RESULT | extracted: {result.records_extracted}")
-        logger.info(f"SYNC RESULT | valid: {result.records_valid}")
-        logger.info(f"SYNC RESULT | failed_validation: {result.records_failed}")
-        logger.info(f"SYNC RESULT | loaded: {result.records_loaded}")
-        logger.info(f"SYNC RESULT | skipped: {result.records_skipped}")
-        logger.info(f"SYNC RESULT | message: {result.message}")
-        logger.info(f"SYNC END    | duration: {duration_ms}ms")
-        logger.info("=" * 60)
-
-        return result
-
-    # ── Private helpers ─────────────────────────────────────────────────────
-
-    def _compute_new_watermark(
-        self,
-        records: list[dict],
-        current_watermark,
-    ) -> tuple[int, int]:
-        """
-        Compute the new UPMJ+UPMT watermark from the records in this batch.
-        Uses the maximum UPMJ seen, and for records with that UPMJ, the
-        maximum UPMT — this becomes the starting point for the next run.
-
-        If no valid UPMJ is found in the batch, returns the current watermark
-        unchanged — the next run will re-process the same records safely.
-
-        Args:
-            records:           Raw JDE records from the extractor
-            current_watermark: SyncWatermark from sync log
-
-        Returns:
-            tuple: (new_upmj, new_upmt)
-        """
-        max_upmj = current_watermark.last_upmj
-        max_upmt = current_watermark.last_upmt
-
-        for record in records:
-            try:
-                upmj = int(record.get("UPMJ") or 0)
-                upmt = int(record.get("UPMT") or 0)
-                if upmj > max_upmj:
-                    max_upmj = upmj
-                    max_upmt = upmt
-                elif upmj == max_upmj and upmt > max_upmt:
-                    max_upmt = upmt
-            except (ValueError, TypeError):
-                continue
-
-        return max_upmj, max_upmt
-
-    def _classify_outcome(self, load_result: LoadResult) -> SyncOutcome:
-        """
-        Map a LoadResult to a SyncOutcome enum value.
-
-        Args:
-            load_result: LoadResult from OdooLoader.load()
-
-        Returns:
-            SyncOutcome: Overall outcome for this sync run.
-        """
-        if load_result.failed > 0:
-            return SyncOutcome.FAILED
-
-        if load_result.not_processed > 0:
-            return SyncOutcome.PARTIAL
-
-        if load_result.loaded > 0 and load_result.skipped > 0:
-            return SyncOutcome.SUCCESS_WITH_SKIPS
-
-        if load_result.loaded > 0:
-            return SyncOutcome.SUCCESS
-
-        if load_result.skipped > 0:
-            return SyncOutcome.NO_OP
-
-        return SyncOutcome.NO_OP
-
-    def _build_message(
-        self,
-        outcome: SyncOutcome,
-        load_result: LoadResult | None,
-        records_extracted: int,
-    ) -> str:
-        """
-        Build a plain English summary message for the sync result.
-
-        Args:
-            outcome:           SyncOutcome enum value
-            load_result:       LoadResult or None for dry runs
-            records_extracted: Total records found by extractor
-
-        Returns:
-            str: Human-readable summary.
-        """
-        messages = {
-            SyncOutcome.NO_OP:    "No new or updated records — sync is up to date",
-            SyncOutcome.DRY_RUN:  f"Dry run complete — {records_extracted} records previewed, no data written",
-            SyncOutcome.SUCCESS:  f"Sync complete — {load_result.loaded if load_result else 0} records created in Odoo",
-            SyncOutcome.SUCCESS_WITH_SKIPS: (
-                f"Sync complete — "
-                f"{load_result.loaded if load_result else 0} created, "
-                f"{load_result.skipped if load_result else 0} already existed"
-            ),
-            SyncOutcome.FAILED:   (
-                f"Sync stopped — "
-                f"{load_result.failed if load_result else 0} record(s) rejected by Odoo. "
-                f"Fix and re-run."
-            ),
-            SyncOutcome.PARTIAL:  "Sync partially complete — some records not processed",
-        }
-        return messages.get(outcome, "Sync complete")
-    
+            logger.info(f"Report generated: {report_path}")
+        except Exception as e:
+            logger.warning(f"Report generation failed (non-fatal): {e}")
+            
