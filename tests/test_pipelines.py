@@ -77,8 +77,10 @@ class TestCustomerPipelineAssembly:
     def test_live_run_uses_odoo_loader(self):
         from pipelines.customer_pipeline import CustomerPipeline
         from loaders.odoo_loader import OdooLoader
-        pipeline = CustomerPipeline(source="mock", dry_run=False)
-        assert isinstance(pipeline.loader, OdooLoader)
+        with patch("pipelines.customer_pipeline.OdooLoader") as mock_loader_class:
+            mock_loader_class.return_value = MagicMock()
+            pipeline = CustomerPipeline(source="mock", dry_run=False)
+            assert mock_loader_class.called
 
     def test_describe_contains_table_name(self):
         from pipelines.customer_pipeline import CustomerPipeline
@@ -248,4 +250,3 @@ class TestBasePipelineContract:
         from pipelines.item_pipeline import ItemPipeline
         pipeline = ItemPipeline(source="mock", dry_run=True)
         assert callable(getattr(pipeline, "compute_watermark", None))
-        
