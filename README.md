@@ -1,18 +1,15 @@
-<div align="center">
- 
-# jde-odoo-migration-toolkit
+# JDE-Odoo Migration Toolkit
+
 > Status: Prototype — architecture validated against synthetic data.
 > Oracle JDE extractor pending real environment access.
 
-**ETL and incremental sync engine for migrating Oracle JDE master data to Odoo ERP —
-designed for production constraints, validated against synthetic data.**
+**ETL and incremental sync engine for migrating Oracle JDE master data to Odoo ERP.
+Designed to handle real-world migration constraints: idempotency, partial failures, temporal inconsistencies, and referential integrity. Currently validated in a single-node prototype environment against synthetic data.**
 
-</div>
- 
 ---
- 
+
 ## Table of Contents
- 
+
 - [Executive Summary](#executive-summary)
 - [Tech Stack](#tech-stack)
 - [Architecture Overview](#architecture-overview)
@@ -22,38 +19,24 @@ designed for production constraints, validated against synthetic data.**
 - [Data Mapping Strategy](#data-mapping-strategy)
 - [Validation Strategy](#validation-strategy)
 - [Reporting and Observability](#reporting-and-observability)
+- [Known Limitations](#known-limitations)
 - [Project Structure](#project-structure)
 - [Running the Project](#running-the-project)
 - [Engineering Challenges and Solutions](#engineering-challenges-and-solutions)
 - [Data Disclaimer](#data-disclaimer)
 - [Future Improvements](#future-improvements)
- 
+
 ---
- 
+
 ## Executive Summary
- 
-ERP migrations are consistently treated as data movement problems. They are not. The real problems are restartability under partial failure, incremental sync correctness at the boundary of two systems with incompatible temporal models, referential integrity across domain registries that vary by deployment instance, and producing audit artefacts that non-technical data owners can verify independently.
- 
+
+ERP migrations are often treated as data movement problems. In practice, the primary challenges are restartability under partial failure, correctness of incremental sync across incompatible temporal models, and preserving referential integrity across deployment-specific domains. This system addresses those constraints explicitly through idempotent writes, composite watermarking, and deterministic validation.
+
 Naive ETL scripts fail in predictable and compounding ways. Without idempotency at the write layer, partial runs create duplicates on restart. Without composite watermarking, incremental sync loses records updated multiple times within the same Julian date. Without batch-level pre-scan, duplicate keys corrupt both records silently instead of rejecting both explicitly. Without a separation between validation logic and orchestration logic, adding a new source table requires modifying core pipeline code.
- 
+
 This system migrates Oracle JDE F0101 Address Book records to Odoo `res.partner` and F4101 Item Master records to Odoo `product.template` via XML-RPC, designed with the following properties: idempotent loads keyed on business identifiers, UPMJ+UPMT watermark-based incremental extraction, deterministic validation with no network calls inside the validator, a frozen UomRegistry shared between validator and loader, atomic stop-on-failure batching with full restart safety, and a four-sheet Excel reconciliation report generated per run. The SyncEngine orchestrates any pipeline that implements `BasePipeline` — adding a new JDE table requires one new pipeline class and zero changes to orchestration.
- 
----
 
-## My Background
-
-This project was built from 5 months of hands-on professional experience
-supporting Oracle JDE to Odoo data migration as manual work:
-receiving extracted data, cleaning it, and loading records into Odoo
-one by one.
-
-After transitioning into automation, this toolkit was built to automate
-that manual workflow using Python. The validation rules, failure modes,
-and data quality problems encoded in this system come from encountering
-them directly in real migration work.
-
-AI tools were used to accelerate implementation. Architecture,
-domain rules, and design decisions were driven manually.
+The validation rules, failure modes, and data quality decisions encoded in this system are derived from direct experience with manual JDE to Odoo migration work. This system encodes those real-world data cleaning decisions into deterministic, testable rules — translating domain knowledge into automation rather than generic ETL patterns.
 
 ---
 
@@ -78,7 +61,8 @@ domain rules, and design decisions were driven manually.
 
 The system enforces a hard boundary between two layers: pipelines own domain logic, SyncEngine owns orchestration logic.
 
-A **pipeline** owns everything specific to one JDE table: which extractor to use, how to transform raw fields into Odoo format, which business rules apply, which Odoo model to write to, which domain registries to build, and how to compute a new watermark from the extracted records. `CustomerPipeline` knows what AN8, AT1, and PH1 mean. `ItemPipeline` knows what ITM, STKT, UOM1, and SRP1 mean. Nothing outside a pipeline knows these field names.
+A **pipeline** owns everything specific to one JDE table: which extractor to use, how to transform raw fields into Odoo format, which business rules apply, which Odoo model to write to, which domain registries to build, and how to compute a new watermark from the extracted records. `CustomerPipeline` knows what AN8, AT1, and PH1 mean. `ItemPipeline` knows what ITM, STKT, UOM1, and SRP1 mean.
+No component outside the pipeline layer is aware of these field names.
 
 **SyncEngine** owns everything that is domain-agnostic: reading the current watermark from `SyncLog`, detecting NO_OP conditions before invoking any pipeline stage, invoking transform and validate and load in sequence, advancing the watermark only on clean runs, classifying the outcome, and optionally triggering report generation. SyncEngine never reads a JDE field name. It receives any object implementing `BasePipeline` and calls the same interface regardless of which table is being processed.
 
@@ -122,7 +106,7 @@ flowchart TD
 
 Idempotency is enforced at the point of write, not in a pre-run check. Before every `create` call, the loader searches Odoo by business key: for customers, AN8 is stored in the `ref` field and searched before every partner create; for items, ITM is stored in `default_code` and searched before every product create. If the record already exists — whether created by this pipeline in a previous run or created outside it — no duplicate is produced and the result is logged as LOADED.
 
-The transaction log skip (`_get_loaded_an8s`, `_get_loaded_itms`) is a performance optimization on top of this guarantee. It avoids XML-RPC round trips for records that were confirmed loaded in a previous run and recorded in SQLite. It is not the source of idempotency. The Odoo existence check is the source of idempotency, and it runs unconditionally for any record not already in the transaction log.
+The transaction log skip (`_get_loaded_an8s`, `_get_loaded_itms`) is a performance optimization on top of this guarantee. It avoids XML-RPC round trips for records confirmed loaded in a previous run. It is not the source of idempotency. The Odoo existence check is the source of idempotency, and it runs unconditionally for any record not already in the transaction log.
 
 The validator does not perform existence checks. That responsibility belongs to the loader because the answer can change between validation and load time, and because making the validator perform network calls would destroy its determinism guarantee.
 
@@ -136,7 +120,7 @@ Watermark computation is delegated to the pipeline via `compute_watermark(record
 
 ### NO_OP Handling
 
-In a scheduled sync context, most executions find zero new records. SyncEngine exits immediately after extraction if `len(records) == 0`, returns `SyncOutcome.NO_OP` with exit code 0, and does not call transform, validate, load, or advance the watermark. The watermark does not advance because the maximum timestamp in the batch — which is how the new watermark is computed — is undefined when there are no records. Calling downstream pipeline stages with an empty list would produce misleading log output and unnecessary openpyxl operations.
+In a scheduled sync context, most executions find zero new records. SyncEngine exits immediately after extraction if `len(records) == 0`, returns `SyncOutcome.NO_OP` with exit code 0, and does not call transform, validate, load, or advance the watermark. The watermark does not advance because the maximum timestamp in the batch is undefined when there are no records, and calling downstream stages with an empty list produces misleading log output.
 
 ### Batch Pre-scan Validation
 
@@ -156,7 +140,7 @@ The `category` field in `UomRecord` comes from the mapping CSV, not from Odoo. T
 
 ### Deterministic Validation
 
-The validator receives an injected, frozen UomRegistry at construction time. During `validate_batch()`, it makes no external calls of any kind. The same input records always produce the same valid/failed split, regardless of the current state of Odoo, the database, or the network. This property is what makes the validator unit-testable with a mock registry, and what makes failures reproducible without infrastructure.
+The validator receives an injected, frozen UomRegistry at construction time. During `validate_batch()`, it makes no external calls of any kind. The same input records always produce the same valid/failed split, regardless of the current state of Odoo, the database, or the network. This makes the validator unit-testable with a mock registry and failures reproducible without infrastructure.
 
 ---
 
@@ -176,11 +160,11 @@ The validator receives an injected, frozen UomRegistry at construction time. Dur
 
 `ItemPipeline` assembles the item stack and owns `UomRegistry` construction. In live mode it authenticates with Odoo and builds the registry from live data. In dry-run mode it builds the registry from `uom_mapping.csv` using mock Odoo records with sequential IDs, allowing the full validation path to execute without an Odoo connection.
 
-**ItemTransformer** maps STKT to Odoo `type` (`S`→`consu`, `N`→`consu`, `O`→`service`) and derives `sale_ok`/`purchase_ok` flags from `STKT_BEHAVIOR`: outside operation items (`O`) have `sale_ok=False, purchase_ok=True`. UOM codes are uppercased and preserved as JDE strings — the transformer does not resolve them to Odoo IDs. SRP1 is parsed to float; empty or None values produce None, not 0.0, because 0.0 is a semantically valid price (free product) and should not be the default for missing data.
+**ItemTransformer** maps STKT to Odoo `type` (`S`→`consu`, `N`→`consu`, `O`→`service`) and derives `sale_ok`/`purchase_ok` flags from `STKT_BEHAVIOR`: outside operation items (`O`) have `sale_ok=False, purchase_ok=True`. UOM codes are uppercased and preserved as JDE strings — the transformer does not resolve them to Odoo IDs. SRP1 is parsed to float; empty or None values produce None, not 0.0, because 0.0 is a semantically valid price and should not be the default for missing data.
 
 **ItemValidator** enforces 9 rules: ITM present, positive, and parseable as integer; ITM unique in batch (pre-scan); name non-empty; STKT in `{S, N, O}`; UOM1 present and resolvable in registry; UOM2 resolvable if present; UOM1 and UOM2 in the same category if both present; `list_price` non-negative if present; STKT=`O` items must have UOM1 in `SERVICE_COMPATIBLE_CATEGORIES` (`{Unit, Time, Working Time, Unit of Time}`), catching semantically wrong combinations like a service item measured in kilograms.
 
-**ItemLoader** resolves UOM codes to integer IDs at payload build time via `uom_registry.resolve(code).id`. It sets `default_code=str(ITM)` as the idempotency key and searches Odoo by `default_code` before every create. The `uom_po_id` field is omitted from payloads because the `purchase_uom` module is not installed on the target Odoo instance — `uom_id` covers both sales and purchase UOM in this configuration.
+**ItemLoader** resolves UOM codes to integer IDs at payload build time via `uom_registry.resolve(code).id`. It sets `default_code=str(ITM)` as the idempotency key and searches Odoo by `default_code` before every create. The `uom_po_id` field is omitted from payloads because the `purchase_uom` module is not installed on the target Odoo instance.
 
 ---
 
@@ -282,11 +266,25 @@ Records that fail validation never reach the loader. Records that fail in the lo
 
 **Sheet 3 — Failed Validation** shows every rejected record with the specific rule identifier (`RULE_05_PHONE_FORMAT`, `RULE_02_AN8_DUPLICATE`, etc.) and a plain English explanation suitable for a business owner to act on without engineering involvement.
 
-**Sheet 4 — Odoo Load Results** shows per-record Odoo outcomes (LOADED, SKIPPED, FAILED, NOT_PROCESSED, DRY RUN) with Odoo IDs for loaded records, fallback IDs from the transaction log for skipped records, and Odoo error messages for rejected records. It answers of the records that passed validation, what actually happened in Odoo.
+**Sheet 4 — Odoo Load Results** shows per-record Odoo outcomes (LOADED, SKIPPED, FAILED, NOT_PROCESSED, DRY RUN) with Odoo IDs for loaded records, fallback IDs from the transaction log for skipped records, and Odoo error messages for rejected records. It answers: of the records that passed validation, what actually happened in Odoo?
 
 Sheets 2 and 4 are intentionally separate. A record can pass validation and still fail to load (Odoo rejects the payload), or pass validation and be skipped (it already existed in Odoo). Merging these sheets would collapse that distinction and make the report less actionable.
 
-All numeric identifier columns (AN8, ITM, phone, VAT/TIN, Odoo partner IDs) are written with Excel Text number format (`@`) and re-set as string values. This prevents Excel from converting long numeric identifiers to scientific notation and from stripping leading zeros from phone numbers — both of which corrupt the data silently.
+All numeric identifier columns (AN8, ITM, phone, VAT/TIN, Odoo partner IDs) are written with Excel Text number format (`@`) and re-set as string values. This prevents Excel from converting long numeric identifiers to scientific notation and from stripping leading zeros from phone numbers.
+
+---
+
+## Known Limitations
+
+**Single-node execution.** The pipeline runs single-threaded on one process. SQLite does not support concurrent writers. Parallel execution requires partitioning by key range and replacing SQLite with Postgres.
+
+**XML-RPC throughput.** Odoo's XML-RPC API processes one record per call. For large datasets this becomes a latency bottleneck. Batch create via ORM or direct database access would be required at scale.
+
+**Schema assumptions.** The current extractors assume standard F0101 and F4101 schemas. Non-standard JDE installations with custom columns or renamed fields will break the column mappings. Config-driven field mapping is documented in Future Improvements but not yet implemented.
+
+**No concurrency protection.** Two pipeline instances running simultaneously against the same Odoo instance could produce duplicate records if both pass the existence check before either completes the create call. A distributed lock or Odoo-side unique constraint would be required to prevent this.
+
+**Validated against synthetic data only.** The system has not been tested against a real Oracle JDE database or production Odoo instance. The mock data exercises known failure modes from manual migration experience, but real data will surface edge cases not yet encountered.
 
 ---
 
@@ -335,7 +333,7 @@ All numeric identifier columns (AN8, ITM, phone, VAT/TIN, Odoo partner IDs) are 
 ## Running the Project
 
 ```bash
-git clone https://github.com/Lawrenze09/jde-odoo-migration.git
+git clone https://github.com/Lawrenzie09/jde-odoo-migration.git
 cd jde-odoo-migration
 
 python -m venv .venv
